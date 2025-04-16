@@ -1,94 +1,148 @@
 import os
 import re
-import time
+import shutil
 import requests
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader
 
-# Function to sanitize filenames by replacing invalid characters and truncate without cutting words
-def sanitize_filename(filename, max_length=150):
-    filename = re.sub(r'[<>:"/\\|?*]', '_', str(filename))
-    name, extension = os.path.splitext(filename)
-    
-    if len(filename) > max_length:
-        max_name_length = max_length - len(extension)
-        truncated = name[:max_name_length].rstrip('_')
-        last_space = truncated.rfind(' ')
-        if last_space != -1:
-            name = truncated[:last_space]
-        else:
-            name = truncated
-    
-    return f"{name}{extension}"
+def sanitize_filename(filename):
+    return re.sub(r'[<>:"/\\|?*]', '_', filename)
 
-# Function to remove HTML tags and replace them with a space
-def strip_html_tags(text):
-    clean = re.compile('<.*?>')
-    return re.sub(clean, ' ', text)
+def fix_caps(text):
+    """If text is all uppercase, convert to title case."""
+    if text and text.isupper():
+        return text.title()
+    return text
 
-# Function to get metadata from CrossRef using the title
-def get_metadata_from_crossref(title):
-    query = title.replace(' ', '+')
-    headers = {
-        'User-Agent': 'MyPDFMetadataUpdater/1.0 (your-email@example.com)'
-    }
-    response = requests.get(f"https://api.crossref.org/works?query.title={query}", headers=headers)
-    if response.status_code == 200:
-        data = response.json()
-        if data['message']['items']:
-            item = data['message']['items'][0]
-            metadata = {
-                'author': ', '.join([str(author['family']) for author in item.get('author', [])]),
-                'title': strip_html_tags(str(item.get('title', ['UnknownTitle'])[0])),
-                'year': str(item.get('published-print', {}).get('date-parts', [[None]])[0][0] or 'UnknownYear')
-            }
-            return metadata
+def extract_doi_from_text(text):
+    match = re.search(r'\b10\.\d{4,9}/[-._;()/:A-Z0-9]+', text, re.IGNORECASE)
+    return match.group(0) if match else None
+
+def extract_isbn_from_text(text):
+    match = re.search(r'ISBN[-‐–]?(1[03])?:?\s*(97(8|9))?\d{9}[\dX]', text.replace('\n', ''), re.IGNORECASE)
+    if match:
+        return re.sub(r'[^0-9X]', '', match.group(0))[-13:]
     return None
 
-# Function to update PDF metadata and rename the file
-def update_and_rename_pdf(file_path, new_metadata):
-    reader = PdfReader(file_path)
-    writer = PdfWriter()
+def extract_ids_from_pdf(reader, max_pages=10):
+    for i in range(min(max_pages, len(reader.pages))):
+        text = reader.pages[i].extract_text()
+        if text:
+            doi = extract_doi_from_text(text)
+            if doi:
+                return 'doi', doi
+            isbn = extract_isbn_from_text(text)
+            if isbn:
+                return 'isbn', isbn
+    return None, None
 
-    writer.append_pages_from_reader(reader)
-    writer.add_metadata({
-        '/Author': new_metadata.get('author', 'UnknownAuthor'),
-        '/Title': new_metadata.get('title', 'UnknownTitle'),
-        '/CreationDate': f"D:{new_metadata.get('year', '0000')}"
-    })
+def query_crossref(doi):
+    url = f"https://api.crossref.org/works/{doi}"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            return response.json().get("message", {})
+    except Exception as e:
+        print(f"[ERROR] CrossRef lookup failed: {e}")
+    return {}
 
-    author_last_name = sanitize_filename(new_metadata.get('author', 'UnknownAuthor').split(',')[0])
-    title = sanitize_filename(new_metadata.get('title', 'UnknownTitle'))
-    year = sanitize_filename(new_metadata.get('year', 'UnknownYear'))
-    new_filename = sanitize_filename(f"{author_last_name} - {year} - {title}.pdf")
+def query_openlibrary(isbn):
+    url = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        return data.get(f"ISBN:{isbn}", {})
+    except Exception as e:
+        print(f"[ERROR] Open Library lookup failed: {e}")
+    return {}
 
-    new_file_path = os.path.join(os.path.dirname(file_path), new_filename)
-    with open(new_file_path, 'wb') as f_out:
-        writer.write(f_out)
-    print(f"Updated and renamed PDF saved as '{new_filename}'")
+def main():
+    input_folder = os.getcwd()
+    base_output = os.path.join(input_folder, "Renamed-PDFs")
+    complete_folder = os.path.join(base_output, "Complete")
+    incomplete_folder = os.path.join(base_output, "Incomplete")
+    os.makedirs(complete_folder, exist_ok=True)
+    os.makedirs(incomplete_folder, exist_ok=True)
 
-# Directory containing your PDFs
-input_folder = 'folder_to_rename'
+    for filename in os.listdir(input_folder):
+        if filename.lower().endswith('.pdf'):
+            file_path = os.path.join(input_folder, filename)
+            try:
+                reader = PdfReader(file_path)
+                metadata = reader.metadata or {}
 
-# Iterate over all PDF files in the directory
-for filename in os.listdir(input_folder):
-    if filename.endswith('.pdf'):
-        file_path = os.path.join(input_folder, filename)
-        try:
-            reader = PdfReader(file_path)
-            current_metadata = reader.metadata
-            title = current_metadata.get('/Title', None)
+                # Extract raw metadata
+                raw_author = metadata.get('/Author')
+                raw_title = metadata.get('/Title')
+                raw_date = metadata.get('/CreationDate')
 
-            if title:
-                print(f"Fetching metadata for '{title}'...")
-                new_metadata = get_metadata_from_crossref(title)
-                
-                if new_metadata:
-                    update_and_rename_pdf(file_path, new_metadata)
-                    time.sleep(1)  # Adjust as needed for polite use
+                # Enrich missing fields
+                if not (raw_author and raw_title and raw_date):
+                    id_type, id_value = extract_ids_from_pdf(reader)
+                    if id_type == 'doi':
+                        data = query_crossref(id_value)
+                        if not raw_author:
+                            authors = data.get("author", [])
+                            if authors:
+                                raw_author = authors[0].get("family", "") or "UnknownAuthor"
+                        if not raw_title:
+                            raw_title = data.get("title", ["UnknownTitle"])[0]
+                        if not raw_date:
+                            year = data.get("published-print", {}).get("date-parts", [[None]])[0][0]
+                            if not year:
+                                year = data.get("published-online", {}).get("date-parts", [[None]])[0][0]
+                            if year:
+                                raw_date = f"D:{year}0000000000"
+
+                    elif id_type == 'isbn':
+                        data = query_openlibrary(id_value)
+                        if not raw_author:
+                            authors = data.get("authors", [])
+                            if authors:
+                                raw_author = authors[0].get("name", "UnknownAuthor")
+                        if not raw_title:
+                            raw_title = data.get("title", "UnknownTitle")
+                        if not raw_date:
+                            year = data.get("publish_date", "")
+                            match = re.search(r"\b\d{4}\b", year)
+                            if match:
+                                raw_date = f"D:{match.group(0)}0000000000"
+
+                # Determine completeness BEFORE cleaning
+                is_complete = bool(raw_author and raw_title and raw_date)
+
+                # Clean + fix caps for filename construction
+                author_fixed = fix_caps(raw_author or "UnknownAuthor")
+                title_fixed = fix_caps(raw_title or "UnknownTitle")
+
+                author_clean = sanitize_filename(author_fixed.replace(" ", "_").split('_')[-1])
+                title_clean = sanitize_filename(title_fixed.replace(" ", "_"))
+
+                # Truncate long titles to 40 characters
+                max_title_length = 40
+                if len(title_clean) > max_title_length:
+                    title_clean = title_clean[:max_title_length].rstrip('_')
+
+                # Format year
+                if raw_date and raw_date.startswith('D:'):
+                    year_clean = sanitize_filename(raw_date[2:6])
+                elif raw_date:
+                    year_clean = sanitize_filename(raw_date[:4])
                 else:
-                    print(f"No metadata found for '{title}'. Skipping.")
-            else:
-                print(f"No title found in metadata for '{filename}'. Skipping.")
+                    year_clean = "UnknownYear"
 
-        except Exception as e:
-            print(f"Failed to process '{filename}': {e}")
+                # Create new filename and path
+                new_filename = f"{author_clean} - {year_clean} - {title_clean}.pdf"
+                output_folder = complete_folder if is_complete else incomplete_folder
+                new_path = os.path.join(output_folder, new_filename)
+
+                if not os.path.exists(new_path):
+                    shutil.copy(file_path, new_path)
+                    print(f"[{('✓' if is_complete else '⚠')}] '{filename}' → '{new_filename}'")
+                else:
+                    print(f"[SKIP] '{new_filename}' already exists")
+
+            except Exception as e:
+                print(f"[ERROR] Couldn't process '{filename}': {e}")
+
+if __name__ == '__main__':
+    main()
